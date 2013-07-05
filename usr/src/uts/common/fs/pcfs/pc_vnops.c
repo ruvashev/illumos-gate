@@ -109,8 +109,12 @@ static int pcfs_getpage(struct vnode *, offset_t, size_t, uint_t *, page_t *[],
 	caller_context_t *);
 static int pcfs_getapage(struct vnode *, u_offset_t, size_t, uint_t *,
 	page_t *[], size_t, struct seg *, caddr_t, enum seg_rw, struct cred *);
+static int pcfs_getpage_miss(struct vnode *, u_offset_t, size_t, struct seg *,
+	caddr_t, page_t *[], size_t, enum seg_rw, int seq);
+static int pcfs_getpage_ra(struct vnode *, u_offset_t, struct seg *, caddr_t);
 static int pcfs_putpage(struct vnode *, offset_t, size_t, int, struct cred *,
 	caller_context_t *);
+static int pcfs_putpages(struct vnode *, offset_t, size_t, int, struct cred *);
 static int pcfs_map(struct vnode *, offset_t, struct as *, caddr_t *, size_t,
 	uchar_t, uchar_t, uint_t, struct cred *, caller_context_t *);
 static int pcfs_addmap(struct vnode *, offset_t, struct as *, caddr_t,
@@ -208,6 +212,19 @@ pcfs_close(
 	struct cred *cr,
 	caller_context_t *ct)
 {
+	/*
+	 * Push partially filled cluster at last close.
+	 * pcfs desn't use dnlc
+	 * Checking for VBAD here will also act as a forced umount check.
+	 */
+	if (vp->v_count <= 1 && vp->v_type != VBAD) {
+		struct pcnode *pcp = VTOPC(vp);
+		if (pcp->pc_delaylen) {
+			(void) pcfs_putpage(vp, pcp->pc_delayoff, pcp->pc_delaylen,
+			    B_FREE, cr, ct);
+			pcp->pc_delaylen = 0;
+		}
+	}
 	return (0);
 }
 
@@ -1416,6 +1433,186 @@ pcfs_readdir(
 	return (error);
 }
 
+/*
+ * pcfs_getpage_miss is called when pcfs_getapage missed the page in the page
+ * cache. The page is either read from the disk, or it's created.
+ * A page is created (without disk read) if rw == S_CREATE, or if
+ * the page is not backed with a real disk block.
+ */
+/* ARGSUSED */
+static int
+pcfs_getpage_miss(
+	struct vnode *vp,
+	u_offset_t off,
+	size_t len,
+	struct seg *seg,
+	caddr_t addr,
+	page_t *pl[],
+	size_t plsz,
+	enum seg_rw rw,
+	int seq)
+{
+	struct pcnode *pcp = VTOPC(vp);
+	struct pcfs *fsp = VFSTOPCFS(vp->v_vfsp);
+	struct vnode *devvp;
+	page_t *pp;
+	daddr_t bn;
+	size_t io_len;
+	int err;
+	uint_t contig;
+	int bsize = fsp->pcfs_clsize;
+
+	contig = pc_rasize(fsp);
+	if (err = pc_bmap(pcp, pc_lblkno(fsp, off), &bn, &contig))
+		return (err);
+
+	u_offset_t io_off;
+	uint_t xlen;
+	struct buf *bp;
+
+	/*
+	 * If access is not in sequential order, we read from disk
+	 * in bsize units.
+	 *
+	 * We limit the size of the transfer to bsize if we are reading
+	 * from the beginning of the file. Note in this situation we
+	 * will hedge our bets and initiate an async read ahead of
+	 * the second block.
+	 */
+	if (!seq || off == 0)
+		contig = MIN(contig, bsize);
+
+	pp = pvn_read_kluster(vp, off, seg, addr, &io_off,
+			&io_len, off, contig, 0);
+
+	/*
+	 * Some other thread has entered the page.
+	 * pcfs_getpage will retry page_lookup.
+	 */
+	if (pp == NULL) {
+		pl[0] = NULL;
+		return (0);
+	}
+
+	/*
+	 * Zero part of the page which we are not
+	 * going to read from the disk.
+	 */
+	xlen = io_len & PAGEOFFSET;
+	if (xlen != 0)
+		pagezero(pp->p_prev, xlen, PAGESIZE - xlen);
+
+	devvp = fsp->pcfs_devvp;
+
+	bp = pageio_setup(pp, io_len, fsp->pcfs_devvp, B_READ);
+	bp->b_edev =devvp->v_rdev;
+	bp->b_dev = cmpdev(devvp->v_rdev);
+	bp->b_blkno = bn + btodt((off & ~(fsp->pcfs_secsize - 1))
+			- (off & ~(fsp->pcfs_clsize - 1)));
+	bp->b_un.b_addr = (caddr_t) 0;
+	bp->b_file = vp;
+	bp->b_offset = off;
+
+	(void) bdev_strategy(bp);
+	lwp_stat_update(LWP_STAT_INBLK, 1);
+
+	pcp->pc_nextrio = off + ((io_len + PAGESIZE - 1) & PAGEMASK);
+
+	/*
+	 * If the file access is sequential, initiate read ahead
+	 * of the next cluster.
+	 */
+	if (seq && pcp->pc_nextrio < pcp->pc_size)
+		(void) pcfs_getpage_ra(vp, off, seg, addr);
+	err = biowait(bp);
+	pageio_done(bp);
+
+	if (err) {
+		pvn_read_done(pp, B_ERROR);
+		return (err);
+	}
+
+	pvn_plist_init(pp, pl, plsz, off, io_len, rw);
+	return (0);
+}
+
+/*
+ * Read ahead a cluster from the disk. Returns the length in bytes.
+ */
+static int
+pcfs_getpage_ra(
+	struct vnode *vp,
+	u_offset_t off,
+	struct seg *seg,
+	caddr_t addr)
+{
+	struct pcnode *pcp = VTOPC(vp);
+	struct pcfs *fsp = VFSTOPCFS(vp->v_vfsp);
+	struct vnode *devvp;
+	page_t *pp;
+	u_offset_t io_off = pcp->pc_nextrio;
+	caddr_t addr2 = addr + (io_off - off);
+	struct buf *bp;
+	daddr_t bn;
+	size_t io_len;
+	int err;
+	uint_t contig;
+	int xlen;
+	int bsize = fsp->pcfs_clsize;
+
+	if (fsp == NULL)
+		return (0);
+
+	/*
+	 * Is this test needed?
+	 */
+	if (addr2 >= seg->s_base + seg->s_size)
+		return (0);
+
+	contig = pc_rasize(fsp);
+	err = pc_bmap(pcp, pc_lblkno(fsp, io_off), &bn, &contig);
+	/*
+	 * XXX Check UFS
+	 */
+	if (err /*|| bn == ? */){
+		PC_DPRINTF1(1, "pc_getpage_ra err=%d", err);
+		return (0);
+	}
+
+	/*
+	 * Limit the transfer size to bsize if this is the 2nd block.
+	 */
+
+	if (io_off == (u_offset_t) bsize)
+		contig = MIN(contig, bsize);
+
+	if ((pp = pvn_read_kluster(vp, io_off, seg, addr2, &io_off,
+			&io_len, io_off, contig, 1)) == NULL)
+		return (0);
+
+	/*
+	 * Zero part of page which we are not going to read from disk
+	 */
+	if ((xlen = (io_len & PAGEOFFSET)) > 0)
+		pagezero(pp->p_prev, xlen, PAGESIZE - xlen);
+
+	pcp->pc_nextrio = (io_off + io_len + PAGESIZE - 1) & PAGEMASK;
+	devvp = fsp->pcfs_devvp;
+
+	bp = pageio_setup(pp, io_len, fsp->pcfs_devvp, B_READ | B_ASYNC);
+	bp->b_edev = devvp->v_rdev;
+	bp->b_dev = cmpdev(devvp->v_rdev);
+	bp->b_blkno = bn + btodt((io_off & ~(fsp->pcfs_secsize - 1))
+			- (io_off & ~(fsp->pcfs_clsize - 1)));
+	bp->b_un.b_addr = (caddr_t) 0;
+	bp->b_file = vp;
+	bp->b_offset = off;
+
+	(void) bdev_strategy(bp);
+	lwp_stat_update(LWP_STAT_INBLK, 1);
+
+	return (io_len);
+}
 
 /*
  * Called from pvn_getpages or pcfs_getpage to get a particular page.
@@ -1569,7 +1766,7 @@ pcfs_getpage(
 	offset_t off,
 	size_t len,
 	uint_t *protp,
-	page_t *pl[],
+	page_t *plarr[],
 	size_t plsz,
 	struct seg *seg,
 	caddr_t addr,
@@ -1593,17 +1790,153 @@ pcfs_getpage(
 		*protp = PROT_ALL;
 
 	ASSERT((off & PAGEOFFSET) == 0);
-	if (len <= PAGESIZE) {
-		err = pcfs_getapage(vp, off, len, protp, pl,
-		    plsz, seg, addr, rw, cr);
-	} else {
-		err = pvn_getpages(pcfs_getapage, vp, off,
-		    len, protp, pl, plsz, seg, addr, rw, cr);
+	if (fsp->pcfs_clsize < PAGESIZE){
+		if (len <= PAGESIZE) {
+			err = pcfs_getapage(vp, off, len, protp, plarr,
+					plsz, seg, addr, rw, cr);
+		} else {
+			err = pvn_getpages(pcfs_getapage, vp, off,
+					len, protp, plarr, plsz, seg, addr, rw, cr);
+		}
+		pc_unlockfs(fsp);
+		return (err);
 	}
+	else{
+		u_offset_t uoff = (u_offset_t)off; /* type conversion */
+		u_offset_t pgoff;
+		u_offset_t eoff;
+		struct pcnode *pcp = VTOPC(vp);
+		page_t **pl;
+		caddr_t pgaddr;
+		int seqmode;
+		int pgsize = PAGESIZE;
+
+		seqmode = pcp->pc_nextr == uoff;
+
+		/*
+		 * The loop looks up pages in the range [off, off + len).
+		 * For each page, we first check if we should initiate an asynchronous
+		 * read ahead before we call page_lookup (we may sleep in page_lookup
+		 * for a previously initiated disk read).
+		 */
+		eoff = (uoff + len);
+		for (pgoff = uoff, pgaddr = addr, pl = plarr;
+				pgoff < eoff; /* empty */) {
+			page_t *pp;
+			u_offset_t nextrio;
+			se_t se;
+			int retval;
+
+			se = SE_SHARED;
+
+			/* Handle async getpage (faultahead) */
+			if (plarr == NULL) {
+				pcp->pc_nextrio = pgoff;
+				(void) pcfs_getpage_ra(vp, pgoff, seg, pgaddr);
+				pgoff += pgsize;
+				pgaddr += pgsize;
+				continue;
+			}
+
+			/*
+			 * Check if we should initiate read ahead of next cluster.
+			 * We call page_exists only when we need to confirm that
+			 * we have the current page before we initiate the read ahead.
+			 */
+			nextrio = pcp->pc_nextrio;
+			if (seqmode &&
+					pgoff + pc_rasize(fsp) >= nextrio && pgoff <= nextrio &&
+					nextrio < pcp->pc_size && page_exists(vp, pgoff)) {
+				retval = pcfs_getpage_ra(vp, pgoff, seg, pgaddr);
+				/*
+				 * We always read ahead the next cluster of data
+				 * starting from i_nextrio. If the page (vp,nextrio)
+				 * is actually in core at this point, the routine
+				 * ufs_getpage_ra() will stop pre-fetching data
+				 * until we read that page in a synchronized manner
+				 * through ufs_getpage_miss(). So, we should increase
+				 * i_nextrio if the page (vp, nextrio) exists.
+				 */
+				if ((retval == 0) && page_exists(vp, nextrio)) {
+					pcp->pc_nextrio = nextrio + pgsize;
+				}
+			}
+
+			if ((pp = page_lookup(vp, pgoff, se)) != NULL) {
+				/*
+				 * We found the page in the page cache.
+				 */
+				*pl++ = pp;
+				pgoff += pgsize;
+				pgaddr += pgsize;
+				len -= pgsize;
+				plsz -= pgsize;
+			} else {
+				/*
+				 * We have to create the page, or read it from disk.
+				 */
+				if (err = pcfs_getpage_miss(vp, pgoff, len, seg, pgaddr,
+						pl, plsz, rw, seqmode))
+					goto error;
+
+				while (*pl != NULL) {
+					pl++;
+					pgoff += pgsize;
+					pgaddr += pgsize;
+					len -= pgsize;
+					plsz -= pgsize;
+				}
+			}
+	}
+
+	/*
+	 * Return pages up to plsz if they are in the page cache.
+	 * We cannot return pages if there is a chance that they are
+	 * backed with a UFS hole and rw is S_WRITE or S_CREATE.
+	 */
+	if (plarr) {
+		eoff = pgoff + plsz;
+		while (pgoff < eoff) {
+			page_t *pp;
+
+			if ((pp = page_lookup_nowait(vp, pgoff, SE_SHARED)) == NULL)
+				break;
+
+			*pl++ = pp;
+			pgoff += pgsize;
+			plsz -= pgsize;
+		}
+	}
+
+	if (plarr)
+		*pl = NULL; /* Terminate page list */
+	pcp->pc_nextr = pgoff;
+
+error:
+	if (err && plarr) {
+		/*
+		 * Release any pages we have locked.
+		 */
+		while (pl > &plarr[0])
+			page_unlock(*--pl);
+
+		plarr[0] = NULL;
+	}
+
+update_pcnode:
+		if ((pcp->pc_flags & PC_ACC) == 0 &&
+				((fsp->pcfs_vfs->vfs_flag & VFS_RDONLY) == 0)) {
+			pc_mark_acc(fsp, pcp);
+		}
+
+unlock:
 	pc_unlockfs(fsp);
+
+out:
 	return (err);
 }
 
+int pcfs_delay = 1;
 
 /*
  * Flags are composed of {B_INVAL, B_FREE, B_DONTNEED, B_FORCE}
@@ -1674,13 +2007,101 @@ pcfs_putpage(
 
 	ASSERT(off <= UINT32_MAX);
 
-	flags &= ~B_ASYNC;	/* XXX should fix this later */
+	if (fsp->pcfs_clsize < PAGESIZE)
+		flags &= ~B_ASYNC;	/* XXX should fix this later */
 
 	err = pc_lockfs(fsp, 0, 0);
 	if (err)
 		return (err);
+
+	if (flags & B_ASYNC) {
+		if (pcfs_delay && len && (flags & ~(B_ASYNC|B_DONTNEED|B_FREE)) == 0) {
+			/*
+			 * If nobody stalled, start a new cluster.
+			 */
+			if (pcp->pc_delaylen == 0) {
+				pcp->pc_delayoff = off;
+				pcp->pc_delaylen = len;
+				goto errout;
+			}
+			/*
+			 * If we have a full cluster or they are not contig,
+			 * then push last cluster and start over.
+			 */
+			if (pcp->pc_delaylen >= pc_rasize(fsp) ||
+					pcp->pc_delayoff + pcp->pc_delaylen != off) {
+				u_offset_t doff;
+				size_t dlen;
+
+				doff = pcp->pc_delayoff;
+				dlen = pcp->pc_delaylen;
+				pcp->pc_delayoff = off;
+				pcp->pc_delaylen = len;
+				err = pcfs_putpages(vp, doff, dlen, flags, cr);
+				/* LMXXX - flags are new val, not old */
+				goto errout;
+			}
+			/*
+			 * There is something there, it's not full, and
+			 * it is contig.
+			 */
+			pcp->pc_delaylen += len;
+			goto errout;
+		}
+		/*
+		 * Must have weird flags or we are not clustering.
+		 */
+	}
+
+	err = pcfs_putpages(vp, off, len, flags, cr);
+
+errout:
+	if (err == 0 && (flags & B_INVAL) &&
+	    off == 0 && len == 0 && vn_has_cached_data(vp)) {
+		/*
+		 * If doing "invalidation", make sure that
+		 * all pages on the vnode list are actually
+		 * gone.
+		 */
+		cmn_err(CE_PANIC,
+		    "pcfs_putpage: B_INVAL, pages not gone");
+	} else if (err) {
+		PC_DPRINTF1(1, "pcfs_putpage err=%d\n", err);
+	}
+	pc_unlockfs(fsp);
+	return (err);
+}
+
+/*
+ * If len == 0, do from off to EOF.
+ *
+ * The normal cases should be len == 0 & off == 0 (entire vp list),
+ * len == MAXBSIZE (from segmap_release actions), and len == PAGESIZE
+ * (from pageout).
+ */
+/*ARGSUSED*/
+static int
+pcfs_putpages(
+	struct vnode *vp,
+	offset_t off,
+	size_t len,
+	int flags,
+	struct cred *cr)
+{
+	u_offset_t io_off;
+	u_offset_t eoff;
+	struct pcnode *pcp = VTOPC(vp);
+	struct pcfs * fsp = VFSTOPCFS(vp->v_vfsp);
+	page_t *pp;
+	size_t io_len;
+	int err = 0;
+
+	if (len == 0) {
+		pcp->pc_delayoff = pcp->pc_delaylen = 0;
+	}
+
 	if (!vn_has_cached_data(vp) || off >= pcp->pc_size) {
-		pc_unlockfs(fsp);
+		/*no unlock????*/
 		return (0);
 	}
 
@@ -1691,6 +2112,10 @@ pcfs_putpage(
 		err = pvn_vplist_dirty(vp, off,
 		    pcfs_putapage, flags, cr);
 	} else {
+		/*
+		 * Loop over all offsets in the range looking for
+		 * pages to deal with.
+		 */
 		eoff = off + len;
 
 		for (io_off = off; io_off < eoff &&
@@ -1727,19 +2152,7 @@ pcfs_putpage(
 			}
 		}
 	}
-	if (err == 0 && (flags & B_INVAL) &&
-	    off == 0 && len == 0 && vn_has_cached_data(vp)) {
-		/*
-		 * If doing "invalidation", make sure that
-		 * all pages on the vnode list are actually
-		 * gone.
-		 */
-		cmn_err(CE_PANIC,
-		    "pcfs_putpage: B_INVAL, pages not gone");
-	} else if (err) {
-		PC_DPRINTF1(1, "pcfs_putpage err=%d\n", err);
-	}
-	pc_unlockfs(fsp);
+
 	return (err);
 }
 
@@ -1764,7 +2177,8 @@ pcfs_putapage(
 	u_offset_t lbn, lbnoff, xferoffset;
 	uint_t pgoff, xfersize;
 	int err = 0;
-	u_offset_t io_off;
+	u_offset_t io_off, off;
+	struct buf *bp;
 
 	pcp = VTOPC(vp);
 	fsp = VFSTOPCFS(vp->v_vfsp);
@@ -1781,56 +2195,101 @@ pcfs_putapage(
 		pcp->pc_flags |= PC_MOD;
 		pc_mark_mod(fsp, pcp);
 	}
-	pp = pvn_write_kluster(vp, pp, &io_off, &io_len, pp->p_offset,
-	    PAGESIZE, flags);
+	if (fsp->pcfs_clsize < PAGESIZE){
+		pp = pvn_write_kluster(vp, pp, &io_off, &io_len, pp->p_offset,
+		    PAGESIZE, flags);
 
-	if (fsp->pcfs_flags & PCFS_IRRECOV) {
-		goto out;
-	}
-
-	PC_DPRINTF1(7, "pc_putpage writing dirty page off=%llu\n", io_off);
-
-	lbn = pc_lblkno(fsp, io_off);
-	lbnoff = io_off & ~(fsp->pcfs_clsize - 1);
-	xferoffset = io_off & ~(fsp->pcfs_secsize - 1);
-
-	for (pgoff = 0; pgoff < io_len && xferoffset < pcp->pc_size;
-	    pgoff += xfersize,
-	    lbn += howmany(xfersize, fsp->pcfs_clsize),
-	    lbnoff += xfersize, xferoffset += xfersize) {
-
-		struct buf *bp;
-		int err1;
-
-		/*
-		 * write as many contiguous blocks as possible from this page
-		 */
-		xfersize = io_len - pgoff;
-		err1 = pc_bmap(pcp, (daddr_t)lbn, &bn, &xfersize);
-		if (err1) {
-			err = err1;
+		if (fsp->pcfs_flags & PCFS_IRRECOV) {
 			goto out;
 		}
+
+		PC_DPRINTF1(7, "pc_putpage writing dirty page off=%llu\n", io_off);
+
+		lbn = pc_lblkno(fsp, io_off);
+		lbnoff = io_off & ~(fsp->pcfs_clsize - 1);
+		xferoffset = io_off & ~(fsp->pcfs_secsize - 1);
+
+		for (pgoff = 0; pgoff < io_len && xferoffset < pcp->pc_size;
+		    pgoff += xfersize,
+		    lbn += howmany(xfersize, fsp->pcfs_clsize),
+		    lbnoff += xfersize, xferoffset += xfersize) {
+
+			int err1;
+
+			/*
+			 * write as many contiguous blocks as possible from this page
+			 */
+			xfersize = io_len - pgoff;
+			err1 = pc_bmap(pcp, (daddr_t) lbn, &bn, &xfersize);
+			if (err1) {
+				err = err1;
+				goto out;
+			}
+			
+			bp = pageio_setup(pp, xfersize, devvp, B_WRITE | flags);
+			bp->b_edev = devvp->v_rdev;
+			bp->b_dev = cmpdev(devvp->v_rdev);
+			bp->b_blkno = bn + btodt(xferoffset - lbnoff);
+			bp->b_un.b_addr = (caddr_t)(uintptr_t)pgoff;
+			bp->b_file = vp;
+			bp->b_offset = (offset_t) (io_off + pgoff);
+
+			(void) bdev_strategy(bp);
+
+			lwp_stat_update(LWP_STAT_OUBLK, 1);
+
+			if (err == 0)
+				err = biowait(bp);
+			else
+				(void) biowait(bp);
+			pageio_done(bp);
+		}
+		pvn_write_done(pp, ((err) ? B_ERROR : 0) | B_WRITE | flags);
+		pp = NULL;
+	}
+	else {
+		/*off = pp->p_offset & (offset_t)fs->fs_bmask;*//* block align it */
+		off = pp->p_offset;	/* block align it */
+		lbn = pc_lblkno(fsp, off);
+		lbnoff = off & ~(fsp->pcfs_clsize - 1);
+		xferoffset = off & ~(fsp->pcfs_secsize - 1);
+
+		xfersize = pc_rasize(fsp);
+		err = pc_bmap(pcp, (daddr_t) lbn, &bn, &xfersize);
+		if (err)
+			goto out;
+
+		/*
+		 * Take the length (of contiguous bytes) passed back from bmap()
+		 * and _try_ and get a set of pages covering that extent.
+		 */
+		pp = pvn_write_kluster(vp, pp, &io_off, &io_len, off, xfersize, flags);
+
+		if (fsp->pcfs_flags & PCFS_IRRECOV)
+			goto out;
+
+
 		bp = pageio_setup(pp, xfersize, devvp, B_WRITE | flags);
 		bp->b_edev = devvp->v_rdev;
 		bp->b_dev = cmpdev(devvp->v_rdev);
 		bp->b_blkno = bn + btodt(xferoffset - lbnoff);
-		bp->b_un.b_addr = (caddr_t)(uintptr_t)pgoff;
+		bp->b_un.b_addr = (caddr_t) (uintptr_t) 0;
 		bp->b_file = vp;
-		bp->b_offset = (offset_t)(io_off + pgoff);
-
-		(void) bdev_strategy(bp);
-
-		lwp_stat_update(LWP_STAT_OUBLK, 1);
-
-		if (err == 0)
+		bp->b_offset = (offset_t) (io_off);
+		/*bp->b_iodone = (int (*)())pcfs_iodone;*/
+		if (bp->b_flags & B_ASYNC) {
+			(void) bdev_strategy(bp);
+			lwp_stat_update(LWP_STAT_OUBLK, 1);
+		} else {
+			(void) bdev_strategy(bp);
+			lwp_stat_update(LWP_STAT_OUBLK, 1);
 			err = biowait(bp);
-		else
-			(void) biowait(bp);
-		pageio_done(bp);
+			pageio_done(bp);
+			pvn_write_done(pp, ((err) ? B_ERROR : 0) | B_WRITE | flags);
+		}
+
+		pp = NULL;
 	}
-	pvn_write_done(pp, ((err) ? B_ERROR : 0) | B_WRITE | flags);
-	pp = NULL;
 
 out:
 	if ((fsp->pcfs_flags & PCFS_IRRECOV) && pp != NULL) {
@@ -1843,8 +2302,8 @@ out:
 		*offp = io_off;
 	if (lenp)
 		*lenp = io_len;
-		PC_DPRINTF4(4, "pcfs_putapage: vp=%p pp=%p off=%lld len=%lu\n",
-		    (void *)vp, (void *)pp, io_off, io_len);
+	PC_DPRINTF4(4, "pcfs_putapage: vp=%p pp=%p off=%lld len=%lu\n",
+			(void *) vp, (void *) pp, io_off, io_len);
 	if (err) {
 		PC_DPRINTF1(1, "pcfs_putapage err=%d", err);
 	}

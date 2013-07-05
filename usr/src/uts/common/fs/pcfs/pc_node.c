@@ -150,6 +150,10 @@ pc_getnode(
 	pcp->pc_scluster = scluster;
 	pcp->pc_lcluster = scluster;
 	pcp->pc_lindex = 0;
+	pcp->pc_nextrio = 0;
+	pcp->pc_nextr = 0;
+	pcp->pc_delaylen = 0;
+	pcp->pc_delayoff = 0;
 	pcp->pc_flags = 0;
 	if (ep->pcd_attr & PCA_DIR) {
 		vn_setops(vp, pcfs_dvnodeops);

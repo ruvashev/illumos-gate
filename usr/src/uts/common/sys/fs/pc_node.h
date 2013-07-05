@@ -62,6 +62,11 @@ struct pcnode {
 	struct pcdir pc_entry;		/* directory entry of file */
 	pc_cluster32_t	pc_lcluster;	/* last cluster visited */
 	daddr_t		pc_lindex;	/* index of last cluster visited */
+	offset_t	pc_nextrio;	/* where to start the next clust */
+	offset_t	pc_nextr;	/* next byte read offset (read-ahead)*/
+	/*   No lock required                */
+	size_t          pc_delaylen;	/* delayed writes, units=bytes */
+	offset_t        pc_delayoff;	/* where we started delaying */
 };
 
 /*

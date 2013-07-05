@@ -553,6 +553,9 @@ struct pcfs_args {
 	((int)(PCF_FIRSTCLUSTER +					\
 	pc_dbtocl(pc_daddrdb(PCFS, DADDR) - (PCFS)->pcfs_datastart)))
 
+#define	pc_rasize(PCFS)                     /* read-ahead size */	\
+	((int)(64 * 1024))
+
 /*
  * Number of directory entries per sector / cluster
  */
